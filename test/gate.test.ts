@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import * as z from "zod";
 import { SignJWT, decodeJwt } from "jose";
 import { createGate, defineTool, type ToolContext } from "../src/index.js";
+import { deriveSigningKeys, readSecrets } from "../src/token.js";
 
 const SECRET = "test-secret-that-is-long-enough-0123456789";
 
@@ -17,6 +18,7 @@ function setup(options: { canManage?: () => boolean; ttlSeconds?: number } = {})
     kind: "read",
     description: "List today's bookings for this venue",
     input: z.object({ day: z.string().min(1) }),
+    authorize: (_input, ctx: Ctx) => ctx.venueId === "venue-1",
     run: (input, ctx: Ctx) => [{ id: "b1", day: input.day, venue: ctx.venueId }],
   });
   const cancelBooking = defineTool({
@@ -116,12 +118,54 @@ describe("handle", () => {
     await expect(gate.cancel(token, noActor)).rejects.toThrow(/actorId/);
   });
 
+  it("treats missing arguments as an empty object, as Gemini sends for tools with no parameters", async () => {
+    const ran: string[] = [];
+    const closeDay = defineTool({
+      name: "close_day",
+      kind: "write",
+      description: "Close today's bookings",
+      input: z.object({}),
+      authorize: () => true,
+      describe: () => ({ action: "Close day", target: "today", danger: false }),
+      run: () => {
+        ran.push("closed");
+        return "closed";
+      },
+    });
+    const gate = createGate<Ctx>({ tools: [closeDay], secret: SECRET });
+    for (const args of [undefined, null]) {
+      const proposed = await gate.handle({ name: "close_day", args }, owner);
+      if (proposed.status !== "pending") throw new Error(`expected pending, got ${proposed.status}`);
+      expect((await gate.confirm(proposed.token, owner)).status).toBe("done");
+    }
+    expect(ran).toEqual(["closed", "closed"]);
+  });
+
+  it("throws on a scope that is not a non-empty string", async () => {
+    const { gate } = setup();
+    const call = { name: "list_bookings", args: { day: "x" } };
+    await expect(gate.handle(call, { actorId: "u", venueId: "venue-1", scope: "" })).rejects.toThrow(/scope/);
+    const numericScope: Ctx = { actorId: "u", venueId: "venue-1" };
+    Reflect.set(numericScope, "scope", 42);
+    await expect(gate.handle(call, numericScope)).rejects.toThrow(/scope/);
+  });
+
   it("keeps its own copy of the tool list", () => {
     const { gate } = setup();
     const tools = [...gate.tools];
     const copy = createGate<Ctx>({ tools, secret: SECRET });
     tools.pop();
     expect(copy.tools).toHaveLength(2);
+  });
+
+  it("checks permission on read tools too", async () => {
+    const { gate } = setup();
+    const otherVenue: Ctx = { actorId: "user-owner", venueId: "venue-2" };
+    expect(await gate.handle({ name: "list_bookings", args: { day: "2026-11-11" } }, otherVenue)).toEqual({
+      status: "rejected",
+      tool: "list_bookings",
+      reason: "forbidden",
+    });
   });
 
   it("gives no token when the actor may not do the action", async () => {
@@ -215,7 +259,7 @@ describe("confirm", () => {
     const token = await pendingToken(gate);
     const claims = decodeJwt(token);
     const reSigned = await new SignJWT(claims)
-      .setProtectedHeader({ alg: "HS256" })
+      .setProtectedHeader({ alg: "HS256", typ: "agent-gate+jwt" })
       .sign(new TextEncoder().encode(SECRET));
     expect(await gate.confirm(reSigned, owner)).toMatchObject({ status: "rejected", reason: "invalid_token" });
     expect(cancelled).toEqual([]);
@@ -253,6 +297,74 @@ describe("confirm", () => {
     const token = await pendingToken(gate);
     vi.setSystemTime(new Date("2026-11-11T09:31:01Z"));
     expect(await gate.confirm(token, owner)).toEqual({ status: "rejected", tool: null, reason: "expired" });
+    expect(cancelled).toEqual([]);
+  });
+
+  it("binds the token to the workspace it was made in", async () => {
+    const { gate, cancelled } = setup();
+    const inA: Ctx = { actorId: "user-owner", venueId: "venue-1", scope: "workspace-a" };
+    const inB: Ctx = { actorId: "user-owner", venueId: "venue-1", scope: "workspace-b" };
+    const proposed = await gate.handle({ name: "cancel_booking", args: { bookingId: "b1" } }, inA);
+    if (proposed.status !== "pending") throw new Error("expected pending");
+    expect(await gate.confirm(proposed.token, inB)).toEqual({
+      status: "rejected",
+      tool: "cancel_booking",
+      reason: "wrong_scope",
+    });
+    expect(await gate.confirm(proposed.token, owner)).toMatchObject({ reason: "wrong_scope" });
+    expect(cancelled).toEqual([]);
+    expect((await gate.confirm(proposed.token, inA)).status).toBe("done");
+  });
+
+  it("refuses to run when the summary the user approved no longer matches", async () => {
+    const names = new Map([["m1", "Ahmed"]]);
+    const ran: string[] = [];
+    const block = defineTool({
+      name: "block",
+      kind: "write",
+      description: "Block a member",
+      input: z.object({ memberId: z.string() }),
+      authorize: () => true,
+      describe: (input) => ({ action: "Block member", target: names.get(input.memberId) ?? "unknown", danger: true }),
+      run: (input) => {
+        ran.push(input.memberId);
+        return "blocked";
+      },
+    });
+    const gate = createGate<Ctx>({ tools: [block], secret: SECRET });
+    const proposed = await gate.handle({ name: "block", args: { memberId: "m1" } }, owner);
+    if (proposed.status !== "pending") throw new Error("expected pending");
+    names.set("m1", "Youssef");
+    expect(await gate.confirm(proposed.token, owner)).toEqual({ status: "rejected", tool: "block", reason: "stale" });
+    expect(ran).toEqual([]);
+    names.set("m1", "Ahmed");
+    expect((await gate.confirm(proposed.token, owner)).status).toBe("done");
+  });
+
+  it("rejects a correctly signed token that is missing the approved summary", async () => {
+    const { gate } = setup();
+    const [key] = await deriveSigningKeys(readSecrets(SECRET));
+    if (!key) throw new Error("no key");
+    const now = Math.floor(Date.now() / 1000);
+    const token = await new SignJWT({ tool: "cancel_booking", input: { bookingId: "b1" } })
+      .setProtectedHeader({ alg: "HS256", typ: "agent-gate+jwt" })
+      .setIssuer("agent-gate")
+      .setAudience("agent-gate/pending-action/v1")
+      .setSubject(owner.actorId)
+      .setJti("00000000-0000-4000-8000-000000000001")
+      .setIssuedAt(now)
+      .setExpirationTime(now + 60)
+      .sign(key);
+    expect(await gate.confirm(token, owner)).toEqual({ status: "rejected", tool: null, reason: "invalid_token" });
+  });
+
+  it("rejects a correctly signed token of another JWT type", async () => {
+    const { gate, cancelled } = setup();
+    const [key] = await deriveSigningKeys(readSecrets(SECRET));
+    if (!key) throw new Error("no key");
+    const claims = decodeJwt(await pendingToken(gate));
+    const retyped = await new SignJWT(claims).setProtectedHeader({ alg: "HS256", typ: "JWT" }).sign(key);
+    expect(await gate.confirm(retyped, owner)).toEqual({ status: "rejected", tool: null, reason: "invalid_token" });
     expect(cancelled).toEqual([]);
   });
 
@@ -353,11 +465,57 @@ describe("cancel", () => {
     expect(cancelled).toEqual([]);
   });
 
+  it("cancels only once", async () => {
+    const { gate } = setup();
+    const token = await pendingToken(gate);
+    await gate.cancel(token, owner);
+    expect(await gate.cancel(token, owner)).toEqual({ status: "rejected", tool: "cancel_booking", reason: "already_used" });
+  });
+
   it("does not let another actor cancel", async () => {
     const { gate } = setup();
     const token = await pendingToken(gate);
     expect(await gate.cancel(token, stranger)).toMatchObject({ reason: "wrong_actor" });
     expect((await gate.confirm(token, owner)).status).toBe("done");
+  });
+});
+
+describe("secret rotation", () => {
+  const OLD = "old-secret-that-is-long-enough-0123456789";
+  const NEW = "new-secret-that-is-long-enough-0123456789";
+
+  function gateWith(secret: string | string[]) {
+    const { gate } = setup();
+    return createGate<Ctx>({ tools: [...gate.tools], secret });
+  }
+
+  it("accepts tokens signed with a previous secret while it is still listed", async () => {
+    const token = await pendingToken(gateWith(OLD));
+    expect((await gateWith([NEW, OLD]).confirm(token, owner)).status).toBe("done");
+  });
+
+  it("signs with the first secret only", async () => {
+    const token = await pendingToken(gateWith([NEW, OLD]));
+    expect(await gateWith(OLD).confirm(token, owner)).toMatchObject({ reason: "invalid_token" });
+    expect((await gateWith(NEW).confirm(token, owner)).status).toBe("done");
+  });
+
+  it("rejects the old secret once it is removed", async () => {
+    const token = await pendingToken(gateWith(OLD));
+    expect(await gateWith(NEW).confirm(token, owner)).toMatchObject({ reason: "invalid_token" });
+  });
+
+  it("still reports expiry for a token signed with a previous secret", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-11T09:30:00Z"));
+    const token = await pendingToken(gateWith(OLD));
+    vi.setSystemTime(new Date("2026-11-11T09:40:00Z"));
+    expect(await gateWith([NEW, OLD]).confirm(token, owner)).toMatchObject({ reason: "expired" });
+  });
+
+  it("refuses an empty list and more than 5 secrets", () => {
+    expect(() => gateWith([])).toThrow(RangeError);
+    expect(() => gateWith(Array.from({ length: 6 }, (_, index) => `${OLD}-${index}`))).toThrow(RangeError);
   });
 });
 
@@ -367,6 +525,7 @@ describe("createGate", () => {
     kind: "read",
     description: "Ping",
     input: z.object({}),
+    authorize: () => true,
     run: () => "pong",
   });
 

@@ -1,7 +1,7 @@
 import type { ActionSummary, ObjectSchema, Tool, ToolContext, WriteTool } from "./tool.js";
 import type * as z from "zod";
 import { memoryReplayStore, type ReplayStore } from "./replay-store.js";
-import { deriveSigningKey, readSecret, signPending, verifyPending, type PendingClaims } from "./token.js";
+import { deriveSigningKeys, readSecrets, signPending, verifyPending, type PendingClaims, type Secret } from "./token.js";
 
 export type RejectReason =
   | "unknown_tool"
@@ -10,6 +10,8 @@ export type RejectReason =
   | "invalid_token"
   | "expired"
   | "wrong_actor"
+  | "wrong_scope"
+  | "stale"
   | "already_used";
 
 export interface ToolCall {
@@ -39,7 +41,7 @@ export type CancelResult =
 
 export interface GateOptions<Ctx extends ToolContext> {
   tools: Tool<Ctx>[];
-  secret: string | Uint8Array;
+  secret: Secret | readonly Secret[];
   ttlSeconds?: number;
   replayStore?: ReplayStore;
 }
@@ -55,7 +57,7 @@ interface GateState<Ctx extends ToolContext> {
   byName: Map<string, Tool<Ctx>>;
   ttlSeconds: number;
   replayStore: ReplayStore;
-  key: Promise<Uint8Array>;
+  keys: Promise<Uint8Array[]>;
 }
 
 type OpenedToken<Ctx extends ToolContext> =
@@ -66,9 +68,12 @@ const TOOL_NAME = /^[a-zA-Z0-9_-]{1,64}$/;
 const DEFAULT_TTL_SECONDS = 300;
 const MAX_TOKEN_LENGTH = 65_536;
 
-function assertActor(ctx: ToolContext): void {
+function assertContext(ctx: ToolContext): void {
   if (typeof ctx.actorId !== "string" || ctx.actorId.length === 0) {
     throw new TypeError("agent-gate: ctx.actorId must be a non-empty string");
+  }
+  if (ctx.scope !== undefined && (typeof ctx.scope !== "string" || ctx.scope.length === 0)) {
+    throw new TypeError("agent-gate: ctx.scope must be a non-empty string when given");
   }
 }
 
@@ -93,6 +98,10 @@ function validateTtl(ttlSeconds: number): number {
   return ttlSeconds;
 }
 
+function sameSummary(current: ActionSummary, approved: ActionSummary): boolean {
+  return current.action === approved.action && current.target === approved.target && current.danger === approved.danger;
+}
+
 function readIssues(error: z.ZodError): string[] {
   return error.issues.map((issue) => `${issue.path.map(String).join(".") || "input"}: ${issue.message}`);
 }
@@ -102,22 +111,24 @@ async function handleCall<Ctx extends ToolContext>(
   call: ToolCall,
   ctx: Ctx,
 ): Promise<HandleResult> {
-  assertActor(ctx);
+  assertContext(ctx);
   const tool = state.byName.get(call.name);
   if (!tool) return { status: "rejected", tool: call.name, reason: "unknown_tool" };
-  const parsed = tool.input.safeParse(call.args);
+  const args = call.args ?? {};
+  const parsed = tool.input.safeParse(args);
   if (!parsed.success) {
     return { status: "rejected", tool: tool.name, reason: "invalid_input", issues: readIssues(parsed.error) };
   }
-  const allowed = tool.authorize ? await tool.authorize(parsed.data, ctx) : true;
-  if (!allowed) return { status: "rejected", tool: tool.name, reason: "forbidden" };
+  if (!(await tool.authorize(parsed.data, ctx))) return { status: "rejected", tool: tool.name, reason: "forbidden" };
   if (tool.kind === "read") {
     return { status: "done", tool: tool.name, output: await tool.run(parsed.data, ctx) };
   }
   const summary = await tool.describe(parsed.data, ctx);
+  const [signingKey] = await state.keys;
+  if (!signingKey) throw new Error("agent-gate: no signing key");
   const signed = await signPending(
-    await state.key,
-    { actorId: ctx.actorId, tool: tool.name, input: call.args },
+    signingKey,
+    { actorId: ctx.actorId, scope: ctx.scope, tool: tool.name, input: args, summary },
     state.ttlSeconds,
   );
   if (signed.token.length > MAX_TOKEN_LENGTH) {
@@ -138,14 +149,15 @@ async function openToken<Ctx extends ToolContext>(
   token: unknown,
   ctx: Ctx,
 ): Promise<OpenedToken<Ctx>> {
-  assertActor(ctx);
+  assertContext(ctx);
   if (typeof token !== "string" || token.length === 0 || token.length > MAX_TOKEN_LENGTH) {
     return { ok: false, tool: null, reason: "invalid_token" };
   }
-  const verified = await verifyPending(await state.key, token);
+  const verified = await verifyPending(await state.keys, token);
   if (!verified.ok) return { ok: false, tool: null, reason: verified.reason };
   const { claims } = verified;
   if (claims.actorId !== ctx.actorId) return { ok: false, tool: claims.tool, reason: "wrong_actor" };
+  if (claims.scope !== ctx.scope) return { ok: false, tool: claims.tool, reason: "wrong_scope" };
   const tool = state.byName.get(claims.tool);
   if (!tool || tool.kind !== "write") return { ok: false, tool: claims.tool, reason: "unknown_tool" };
   return { ok: true, tool, claims };
@@ -165,6 +177,9 @@ async function confirmToken<Ctx extends ToolContext>(
   }
   if (!(await tool.authorize(parsed.data, ctx))) {
     return { status: "rejected", tool: tool.name, reason: "forbidden" };
+  }
+  if (!sameSummary(await tool.describe(parsed.data, ctx), claims.summary)) {
+    return { status: "rejected", tool: tool.name, reason: "stale" };
   }
   if (!(await state.replayStore.claim(claims.tokenId, claims.expiresAt))) {
     return { status: "rejected", tool: tool.name, reason: "already_used" };
@@ -187,13 +202,13 @@ async function cancelToken<Ctx extends ToolContext>(
 }
 
 export function createGate<Ctx extends ToolContext>(options: GateOptions<Ctx>): Gate<Ctx> {
-  const key = deriveSigningKey(readSecret(options.secret));
-  key.catch(() => undefined);
+  const keys = deriveSigningKeys(readSecrets(options.secret));
+  keys.catch(() => undefined);
   const state: GateState<Ctx> = {
     byName: indexTools(options.tools),
     ttlSeconds: validateTtl(options.ttlSeconds ?? DEFAULT_TTL_SECONDS),
     replayStore: options.replayStore ?? memoryReplayStore(),
-    key,
+    keys,
   };
   return {
     handle: (call, ctx) => handleCall(state, call, ctx),

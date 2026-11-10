@@ -1,20 +1,37 @@
-import { SignJWT, jwtVerify, errors } from "jose";
+import { SignJWT, jwtVerify, errors, type JWTPayload } from "jose";
+import * as z from "zod";
+import type { ActionSummary } from "./tool.js";
 
 const ISSUER = "agent-gate";
 const AUDIENCE = "agent-gate/pending-action/v1";
+const TOKEN_TYPE = "agent-gate+jwt";
 const MIN_SECRET_BYTES = 32;
+const MAX_SECRETS = 5;
+
+export type Secret = string | Uint8Array;
+
+const signedClaimsSchema = z.object({
+  sub: z.string().min(1),
+  jti: z.string().min(1),
+  exp: z.number().int(),
+  tool: z.string().min(1),
+  scp: z.string().optional(),
+  sum: z.object({ action: z.string(), target: z.string(), danger: z.boolean() }),
+});
 
 export interface PendingClaims {
   tokenId: string;
   actorId: string;
+  scope: string | undefined;
   tool: string;
   input: unknown;
+  summary: ActionSummary;
   expiresAt: Date;
 }
 
 export type VerifyFailure = "invalid_token" | "expired";
 
-export function readSecret(secret: string | Uint8Array): Uint8Array<ArrayBuffer> {
+function readSecret(secret: Secret): Uint8Array<ArrayBuffer> {
   const raw = typeof secret === "string" ? new TextEncoder().encode(secret) : new Uint8Array(secret);
   if (raw.byteLength < MIN_SECRET_BYTES) {
     throw new RangeError(`agent-gate: secret must be at least ${MIN_SECRET_BYTES} bytes`);
@@ -22,16 +39,26 @@ export function readSecret(secret: string | Uint8Array): Uint8Array<ArrayBuffer>
   return raw;
 }
 
-export async function deriveSigningKey(raw: Uint8Array<ArrayBuffer>): Promise<Uint8Array> {
-  const hmacKey = await crypto.subtle.importKey(
-    "raw",
-    raw,
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
+export function readSecrets(secret: Secret | readonly Secret[]): Uint8Array<ArrayBuffer>[] {
+  const list = typeof secret === "string" || secret instanceof Uint8Array ? [secret] : [...secret];
+  if (list.length < 1 || list.length > MAX_SECRETS) {
+    throw new RangeError(`agent-gate: give between 1 and ${MAX_SECRETS} secrets`);
+  }
+  return list.map(readSecret);
+}
+
+async function deriveSigningKey(raw: Uint8Array<ArrayBuffer>): Promise<Uint8Array> {
+  const material = await crypto.subtle.importKey("raw", raw, "HKDF", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(32), info: new TextEncoder().encode(AUDIENCE) },
+    material,
+    256,
   );
-  const purpose = new TextEncoder().encode(AUDIENCE);
-  return new Uint8Array(await crypto.subtle.sign("HMAC", hmacKey, purpose));
+  return new Uint8Array(bits);
+}
+
+export function deriveSigningKeys(secrets: Uint8Array<ArrayBuffer>[]): Promise<Uint8Array[]> {
+  return Promise.all(secrets.map(deriveSigningKey));
 }
 
 export async function signPending(
@@ -42,8 +69,10 @@ export async function signPending(
   const tokenId = crypto.randomUUID();
   const issuedAt = Math.floor(Date.now() / 1000);
   const expiresAt = new Date((issuedAt + ttlSeconds) * 1000);
-  const token = await new SignJWT({ tool: claims.tool, input: claims.input })
-    .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+  const payload: JWTPayload = { tool: claims.tool, input: claims.input, sum: claims.summary };
+  if (claims.scope !== undefined) payload.scp = claims.scope;
+  const token = await new SignJWT(payload)
+    .setProtectedHeader({ alg: "HS256", typ: TOKEN_TYPE })
     .setIssuer(ISSUER)
     .setAudience(AUDIENCE)
     .setSubject(claims.actorId)
@@ -54,33 +83,49 @@ export async function signPending(
   return { token, tokenId, expiresAt };
 }
 
+async function verifySignature(
+  keys: Uint8Array[],
+  token: string,
+): Promise<{ ok: true; payload: JWTPayload } | { ok: false; reason: VerifyFailure }> {
+  for (const key of keys) {
+    try {
+      const { payload } = await jwtVerify(token, key, {
+        algorithms: ["HS256"],
+        typ: TOKEN_TYPE,
+        issuer: ISSUER,
+        audience: AUDIENCE,
+      });
+      return { ok: true, payload };
+    } catch (error) {
+      if (error instanceof errors.JWSSignatureVerificationFailed) continue;
+      if (error instanceof errors.JWTExpired) return { ok: false, reason: "expired" };
+      if (error instanceof errors.JOSEError) return { ok: false, reason: "invalid_token" };
+      throw error;
+    }
+  }
+  return { ok: false, reason: "invalid_token" };
+}
+
 export async function verifyPending(
-  key: Uint8Array,
+  keys: Uint8Array[],
   token: string,
 ): Promise<{ ok: true; claims: PendingClaims } | { ok: false; reason: VerifyFailure }> {
-  try {
-    const { payload } = await jwtVerify(token, key, {
-      algorithms: ["HS256"],
-      issuer: ISSUER,
-      audience: AUDIENCE,
-      requiredClaims: ["sub", "jti", "exp", "tool"],
-    });
-    if (typeof payload.tool !== "string" || !payload.sub || !payload.jti || !payload.exp) {
-      return { ok: false, reason: "invalid_token" };
-    }
-    return {
-      ok: true,
-      claims: {
-        tokenId: payload.jti,
-        actorId: payload.sub,
-        tool: payload.tool,
-        input: payload.input,
-        expiresAt: new Date(payload.exp * 1000),
-      },
-    };
-  } catch (error) {
-    if (error instanceof errors.JWTExpired) return { ok: false, reason: "expired" };
-    if (error instanceof errors.JOSEError) return { ok: false, reason: "invalid_token" };
-    throw error;
-  }
+  const verified = await verifySignature(keys, token);
+  if (!verified.ok) return verified;
+  const { payload } = verified;
+  const parsed = signedClaimsSchema.safeParse(payload);
+  if (!parsed.success) return { ok: false, reason: "invalid_token" };
+  const claims = parsed.data;
+  return {
+    ok: true,
+    claims: {
+      tokenId: claims.jti,
+      actorId: claims.sub,
+      scope: claims.scp,
+      tool: claims.tool,
+      input: payload.input,
+      summary: claims.sum,
+      expiresAt: new Date(claims.exp * 1000),
+    },
+  };
 }

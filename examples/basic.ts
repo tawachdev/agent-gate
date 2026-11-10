@@ -12,6 +12,7 @@ const getMember = defineTool({
   kind: "read",
   description: "Look up one member of this venue by name",
   input: z.object({ name: z.string().min(1) }),
+  authorize: (_input, ctx: Ctx) => ctx.venueId === "venue_1",
   run: (input) => ({ id: "m_42", name: input.name, blocked: blocked.has("m_42") }),
 });
 

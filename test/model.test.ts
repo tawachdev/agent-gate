@@ -85,5 +85,10 @@ describe("forModel", () => {
       status: "rejected",
       reason: "forbidden",
     });
+    expect(forModel({ status: "rejected", tool: "x", reason: "invalid_input", issues: ["memberId: Required"] })).toEqual({
+      status: "rejected",
+      reason: "invalid_input",
+      issues: ["memberId: Required"],
+    });
   });
 });

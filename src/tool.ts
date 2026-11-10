@@ -2,6 +2,7 @@ import type * as z from "zod";
 
 export interface ToolContext {
   actorId: string;
+  scope?: string;
 }
 
 export interface ActionSummary {
@@ -28,7 +29,7 @@ interface ToolBase<Schema extends ObjectSchema> {
 export interface ReadTool<Schema extends ObjectSchema, Ctx extends ToolContext, Output>
   extends ToolBase<Schema> {
   kind: "read";
-  authorize?(input: z.output<Schema>, ctx: Ctx): Awaitable<boolean>;
+  authorize(input: z.output<Schema>, ctx: Ctx): Awaitable<boolean>;
   run(input: z.output<Schema>, ctx: Ctx): Awaitable<Output>;
 }
 
