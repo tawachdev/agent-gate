@@ -1,7 +1,7 @@
 # agent-gate
 
 [![CI](https://github.com/tawachdev/agent-gate/actions/workflows/ci.yml/badge.svg)](https://github.com/tawachdev/agent-gate/actions/workflows/ci.yml)
-[![npm](https://img.shields.io/npm/v/agent-gate)](https://www.npmjs.com/package/agent-gate)
+[![npm](https://img.shields.io/npm/v/@tawachdev/agent-gate)](https://www.npmjs.com/package/@tawachdev/agent-gate)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 Your AI agent can read anything you allow. It can change nothing until a human says yes.
@@ -37,14 +37,14 @@ sequenceDiagram
 Needs: Node.js 22 or newer, and Zod 4.2 or newer.
 
 ```bash
-npm install agent-gate zod
+npm install @tawachdev/agent-gate zod
 ```
 
 **1. Describe your tools.** Mark each one `read` or `write`.
 
 ```ts
 import * as z from "zod";
-import { createGate, defineTool, forModel } from "agent-gate";
+import { createGate, defineTool, forModel } from "@tawachdev/agent-gate";
 
 const blockMember = defineTool({
   name: "block_member",
@@ -161,7 +161,7 @@ The default store lives in one process. Two servers with two in-memory stores wo
 
 ```ts
 import pg from "pg";
-import { POSTGRES_REPLAY_TABLE_SQL, createGate, postgresReplayStore } from "agent-gate";
+import { POSTGRES_REPLAY_TABLE_SQL, createGate, postgresReplayStore } from "@tawachdev/agent-gate";
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 await pool.query(POSTGRES_REPLAY_TABLE_SQL);

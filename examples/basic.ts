@@ -1,5 +1,5 @@
 import * as z from "zod";
-import { createGate, defineTool, forModel, type ToolContext } from "agent-gate";
+import { createGate, defineTool, forModel, type ToolContext } from "@tawachdev/agent-gate";
 
 interface Ctx extends ToolContext {
   venueId: string;
